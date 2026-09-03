@@ -245,6 +245,7 @@ class Gui:
             self.memory = {}
             self.errors = []
             self.memory_title = ""
+            self.atr = []
 
             def add(key, value):
                 self.report[key] = value
@@ -267,6 +268,7 @@ class Gui:
             add("Python", sys.version.split()[0])
             try:
                 atr = conn.getATR()
+                self.atr = atr
                 add("ATR", core.hx(atr))
                 note = atr_note(atr)
                 if note:
@@ -276,7 +278,7 @@ class Gui:
                 add("ATR", "-")
                 self.errors.append("getATR: %s" % exc)
 
-            contact = "ICC" in str(reader).upper()
+            contact = core._is_icc(reader)
             sak = self._poll(tx, add, send)
 
             if sak in (0x08, 0x09, 0x18):
@@ -287,7 +289,7 @@ class Gui:
                 send(("status", "Чтение страниц NTAG / Ultralight…"))
                 self._ntag(tx, add, send)
                 self.memory_title = "ПАМЯТЬ - СТРАНИЦЫ NTAG / ULTRALIGHT (hex)"
-            elif contact or sak in (0x20, 0x28):
+            elif contact:
                 send(("status", "Поиск EMV-приложений (PPSE)…"))
                 self._emv(tx, add, send)
 
@@ -326,14 +328,29 @@ class Gui:
             add("SAK (SEL_RES)", "%02X" % sak)
             add("Тип карты", core.SAK_TYPES.get(sak,
                                                 "неизвестен (SAK=%02X)" % sak))
+            add("Источник типа", "из Polling D4 4A")
             if nlen:
                 add("NFCID", core.hx(data[7:7 + nlen]))
             send(("log", "ok", "Тип карты: " +
                   core.SAK_TYPES.get(sak, "SAK=%02X" % sak)))
         else:
-            add("ATQA (SENS_RES)", "-")
-            add("SAK (SEL_RES)", "-")
-            add("Тип карты", "не ISO 14443 (вероятно, контактная)")
+            add("ATQA (SENS_RES)", "- (polling вернул 0 целей)")
+            add("SAK (SEL_RES)", "- (polling вернул 0 целей)")
+            # Резервный канал: тип зашит в синтетическом ATR ридера.
+            atr = getattr(self, "atr", []) or []
+            if len(atr) >= 15 and list(atr[:12]) == core.ACS_ATR_PREFIX:
+                code = (atr[13] << 8) | atr[14]
+                add("Код карты (ACS)", "%04X" % code)
+                hit = core.ACS_CARD_CODES.get(code)
+                if hit:
+                    name, sak = hit
+                    add("Тип карты", name)
+                    add("Источник типа", "из ATR (байты H10-H11, polling молчал)")
+                    send(("log", "ok", "Тип карты: %s (из ATR)" % name))
+                else:
+                    add("Тип карты", "не определён (код %04X не в таблице)" % code)
+            else:
+                add("Тип карты", "не определён (нет ни polling, ни кода в ATR)")
 
         data, sw = tx(core.PICC_STATUS)
         if sw == 0x9000 and len(data) >= 5:
