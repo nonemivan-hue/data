@@ -1,255 +1,453 @@
 # -*- coding: utf-8 -*-
 """
-acr1281_gui.py — графический интерфейс чтения карт через ACR1281U (Windows)
+acr1281_gui.py — графический интерфейс для чтения карт ACR1281U (v2.0, tkinter)
 
-Использует логику acr1281_dump.py (v1.1) — держите оба файла в одной папке.
-tkinter входит в состав Python под Windows, поэтому новых зависимостей
-кроме pyscard не появляется.
+Запуск:      python acr1281_gui.py
+Требования:  рядом должен лежать acr1281_dump.py (общее ядро чтения v1.2),
+             установленный pyscard. tkinter входит в состав Python (Windows).
 
-Запуск GUI:          python acr1281_gui.py
-Консольная версия:   python acr1281_dump.py
+Возможности:
+  * выбор ридера (PICC/ICC) и автоперебор интерфейсов;
+  * сканирование в фоновом потоке — окно не зависает;
+  * живая таблица «параметр : значение» (двойной клик — копирование);
+  * вкладка «Память»: hex-сетка блоков/страниц со статусом ключей и
+    поиском по дампу (hex или ASCII) — например, длинных номеров;
+  * вкладка «ATR»: побайтовый разбор ответа на сброс (включая тип карты
+    из синтетического ATR ACS, байты H10-H11);
+  * вкладка «Журнал»: события ok / warn / err со временем;
+  * сохранение отчёта (.txt «параметр : значение» + .json) и открытие
+    сохранённого отчёта обратно в окно.
 """
 
 import json
+import os
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import filedialog, messagebox, ttk
-
-try:
-    import acr1281_dump as core
-except ImportError:
-    sys.exit("[!] Файл acr1281_dump.py не найден рядом с acr1281_gui.py.")
+from tkinter import filedialog, ttk
 
 from smartcard.CardConnection import CardConnection
 from smartcard.Exceptions import (CardConnectionException, NoCardException,
                                   SmartcardException)
-from smartcard.System import readers
 
-ACCENT = "#e8501d"
-C_OK = "#1e7a46"
-C_WARN = "#a86a00"
-C_ERR = "#c0392b"
+import acr1281_dump as core
 
-ACS_TYPES = {
-    0x0001: "Mifare Classic 1K", 0x0002: "Mifare Classic 4K",
-    0x0003: "Mifare Ultralight", 0x0010: "Mifare Mini",
-    0x0020: "Mifare DESFire", 0x0026: "Mifare Plus",
-    0x002b: "NTAG213", 0x002c: "NTAG215", 0x002d: "NTAG216",
-    0xf004: "Topaz / Jewel", 0xf011: "FeliCa 212K",
+GUI_VERSION = "2.0"
+
+# ------------------------------------------------------------------ палитра
+INK = "#0d1b26"
+PAPER = "#eef1f2"
+ACC = "#f0561c"
+AMBER = "#f2a51b"
+LED_GREEN = "#2ebd6b"
+LED_GRAY = "#8a9aa5"
+NIGHT = "#101c26"
+
+TAG_COLORS = {
+    "ok": "#dff2e6",
+    "fail": "#fbe4e0",
+    "trailer": "#fdf0d3",
+    "hit": "#ffd9c2",
+    "plain": "#ffffff",
 }
 
 
-def atr_note(atr):
-    """Человекочитаемая заметка об ATR одной строкой."""
-    if not atr:
-        return ""
-    if list(atr[:4]) == [0x3B, 0x8F, 0x80, 0x01] and len(atr) >= 15:
-        code = (atr[13] << 8) | atr[14]
-        name = ACS_TYPES.get(code)
-        base = "синтетический ATR ACS: бесконтактная карта как T=1"
-        return base + (", тип: " + name if name else "")
-    if atr[0] == 0x3B:
-        return "прямая конвенция — похоже на контактную карту (ICC-слот)"
-    if atr[0] == 0x3F:
-        return "обратная конвенция (встречается редко)"
-    return ""
+# ------------------------------------------------------------- разбор ATR
+def acs_hist_detail(j, hist):
+    if hist and hist[0] == 0x80:
+        table = {
+            0: "индикатор категории 80 (ISO 7816-4)",
+            1: "тег 4F — есть AID", 2: "длина поля данных",
+            9: "тип карты, старший байт", 10: "тип карты, младший байт",
+        }
+        if 3 <= j <= 7:
+            return "RID A0 00 00 03 06 — PC/SC Workgroup"
+        if j == 8:
+            return "байт стандарта: 03 = ISO 14443-3"
+        return table.get(j, "RFU — зарезервировано")
+    return "байт ATS / ATQB (ISO 14443-4)"
 
 
-class Gui:
-    def __init__(self, root):
-        self.root = root
-        self.q = queue.Queue()
-        self.busy = False
+def atr_decode(b):
+    """ATR -> список строк (имя, hex, пояснение)."""
+    rows = []
+    if not b:
+        return [("ATR", "-", "карта не вернула ATR")]
+    h2 = lambda x: "%02X" % x
+    rows.append(("TS", h2(b[0]),
+                 "прямая конвенция" if b[0] == 0x3B else
+                 "обратная конвенция" if b[0] == 0x3F else "ошибка TS"))
+    if len(b) < 2:
+        return rows
+    t0 = b[1]
+    K = t0 & 0x0F
+    rows.append(("T0", h2(t0), "Y1=%s, K=%d исторических байт"
+                 % (format(t0 >> 4, "04b"), K)))
+
+    # синтетический ATR ридеров ACS (по спеке: TD1=80, TD2=01, TCK в конце)
+    if (t0 >> 4) == 0x8 and len(b) >= 4 and b[2] == 0x80 and b[3] == 0x01:
+        rows.append(("TD1", "80", "по спецификации ACS: дальше TD2"))
+        rows.append(("TD2", "01", "протокол T=1, последний байт — TCK"))
+        h0 = 4
+        hist = list(b[h0:h0 + K])
+        for i, v in enumerate(hist):
+            rows.append(("H%d" % (i + 1), h2(v), acs_hist_detail(i, hist)))
+        if len(b) > h0 + K:
+            tck = b[h0 + K]
+            x = 0
+            for v in b[1:h0 + K]:
+                x ^= v
+            rows.append(("TCK", h2(tck),
+                         "XOR(T0..H) совпадает — верно" if x == tck
+                         else "ошибка: XOR=%s" % h2(x)))
+        if len(hist) >= 11 and hist[0] == 0x80:
+            code = (hist[9] << 8) | hist[10]
+            hit = core.ACS_CARD_CODES.get(code)
+            rows.append(("TIP", "%04X" % code,
+                         "тип карты ACS: %s" % hit[0] if hit
+                         else "кода нет в таблице ACS"))
+        return rows
+
+    # общий случай ISO 7816-3
+    i = 2
+    Y = t0 >> 4
+    n = 1
+    while Y and i < len(b):
+        for bit, name in ((8, "TA%d" % n), (4, "TB%d" % n), (2, "TC%d" % n)):
+            if (Y & bit) and i < len(b):
+                rows.append((name, h2(b[i]), "интерфейсный символ"))
+                i += 1
+        if (Y & 1) and i < len(b):
+            Y = b[i] >> 4
+            rows.append(("TD%d" % n, h2(b[i]), "протокол T=%d" % (b[i] & 0xF)))
+            n += 1
+            i += 1
+        else:
+            Y = 0
+    for j in range(min(K, len(b) - i)):
+        rows.append(("H%d" % (j + 1), h2(b[i + j]), "исторический байт"))
+    return rows
+
+
+# ------------------------------------------------------------------ окно
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ACR1281U — чтение карты  (GUI v%s, ядро v%s)"
+                   % (GUI_VERSION, core.VERSION))
+        self.geometry("1100x660")
+        self.minsize(960, 560)
+        self.configure(background=PAPER)
+
+        self.queue = queue.Queue()
+        self.working = False
         self.report = {}
-        self.memory = {}
+        self.mem_hex = {}          # label -> hex (для сохранения)
+        self.mem_tags = {}         # id строки -> базовый тег
         self.memory_title = ""
         self.errors = []
+        self.atr_bytes = []
 
-        root.title("ACR1281U — чтение карты")
-        root.geometry("1080x660")
-        root.minsize(880, 540)
+        self._style()
+        self._toolbar()
+        self._body()
+        self._statusbar()
+        self.after(100, self._poll)
+        self.log("info", "Готово. Выберите ридер и нажмите «Сканировать карту».")
 
-        self.style = ttk.Style()
-        self.style.configure("TButton", padding=5, font=("Segoe UI", 10))
-        self.style.configure("Scan.TButton", font=("Segoe UI", 10, "bold"))
-        self.style.configure("Treeview", font=("Consolas", 10), rowheight=26)
-        self.style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        self.style.configure("Accent.Horizontal.TProgressbar",
-                             troughcolor="#e3ded2", background=ACCENT,
-                             bordercolor=ACCENT, lightcolor=ACCENT,
-                             darkcolor=ACCENT)
+    # ------------------------------------------------- стиль
+    def _style(self):
+        st = ttk.Style(self)
+        st.theme_use("clam")
+        st.configure("TFrame", background=PAPER)
+        st.configure("TLabel", background=PAPER, foreground=INK)
+        st.configure("Hdr.TLabel", background=PAPER, foreground=INK,
+                     font=("Segoe UI", 9, "bold"))
+        st.configure("TButton", padding=(10, 5))
+        st.configure("Acc.TButton", foreground="white", background=ACC,
+                     font=("Segoe UI", 9, "bold"), padding=(14, 5))
+        st.map("Acc.TButton", background=[("active", "#c74312")])
 
-        self._build_toolbar()
-        self._build_tabs()
-        self._build_statusbar()
+        st.configure("Treeview", rowheight=24, fieldbackground="#ffffff",
+                     foreground=INK, borderwidth=0)
+        st.configure("Treeview.Heading", background=INK, foreground="#eef1f2",
+                     relief="flat", font=("Segoe UI", 9, "bold"))
+        st.map("Treeview", background=[("selected", "#d7e3ea")])
 
-        self.refresh_readers()
-        self.root.after(90, self._pump)
+        st.configure("Params.Treeview", font=("Consolas", 10))
+        st.configure("Mem.Treeview", font=("Consolas", 10))
+        st.configure("Atr.Treeview", font=("Consolas", 10))
 
-    # ------------------------------------------------------------ интерфейс
-    def _build_toolbar(self):
-        bar = ttk.Frame(self.root, padding=(10, 8))
-        bar.pack(fill="x")
+        st.configure("Log.Treeview", background=NIGHT, fieldbackground=NIGHT,
+                     foreground="#d7e3ea", font=("Consolas", 10), rowheight=22)
+        st.configure("Log.Treeview.Heading", background="#16283a")
+        st.map("Log.Treeview", background=[("selected", "#1c3040")])
 
-        ttk.Label(bar, text="Ридер:").pack(side="left")
+        st.configure("Dark.TFrame", background=NIGHT)
+        st.configure("Dark.TLabel", background=NIGHT, foreground="#9fb3c0",
+                     font=("Consolas", 9))
+        st.configure("Acc.TEntry", fieldbackground="#ffffff")
+
+    # ------------------------------------------------- тулбар
+    def _toolbar(self):
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=10, pady=(10, 4))
+
+        ttk.Label(bar, text="Ридер:", style="Hdr.TLabel").pack(side="left")
         self.reader_var = tk.StringVar()
-        self.combo = ttk.Combobox(bar, textvariable=self.reader_var,
-                                  state="readonly", width=42)
-        self.combo.pack(side="left", padx=(6, 4))
+        self.reader_box = ttk.Combobox(bar, textvariable=self.reader_var,
+                                       state="readonly", width=46)
+        self.reader_box.pack(side="left", padx=(6, 2))
 
-        ttk.Button(bar, text="Обновить", width=9,
-                   command=self.refresh_readers).pack(side="left")
+        ttk.Button(bar, text="Обновить", command=self.on_refresh).pack(side="left")
 
-        self.scan_btn = ttk.Button(bar, text="  Сканировать карту  ",
-                                   style="Scan.TButton", command=self.scan)
-        self.scan_btn.pack(side="left", padx=(14, 4))
+        self.scan_btn = ttk.Button(bar, text="Сканировать карту",
+                                   style="Acc.TButton", command=self.on_scan)
+        self.scan_btn.pack(side="left", padx=(10, 2))
 
-        self.save_btn = ttk.Button(bar, text="Сохранить отчёт…",
-                                   command=self.save, state="disabled")
-        self.save_btn.pack(side="left")
+        ttk.Button(bar, text="Сохранить отчёт…",
+                   command=self.on_save).pack(side="right", padx=(2, 0))
+        ttk.Button(bar, text="Открыть отчёт…",
+                   command=self.on_open).pack(side="right")
 
-        ttk.Button(bar, text="Очистить", width=9,
-                   command=self.clear).pack(side="right")
+        self.on_refresh()
 
-    def _build_tabs(self):
-        self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+    # ------------------------------------------------- основная область
+    def _body(self):
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=10, pady=6)
 
-        # -- параметры
-        f_params = ttk.Frame(self.nb)
-        cols = ("param", "value")
-        self.params = ttk.Treeview(f_params, columns=cols, show="headings")
-        self.params.heading("param", text="Параметр")
-        self.params.heading("value", text="Значение")
-        self.params.column("param", width=260, stretch=False)
-        self.params.column("value", width=640)
-        sb = ttk.Scrollbar(f_params, orient="vertical",
-                           command=self.params.yview)
-        self.params.configure(yscrollcommand=sb.set)
-        self.params.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.nb.add(f_params, text="  Параметры  ")
+        # левая колонка — параметры
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        ttk.Label(left, text="ПАРАМЕТРЫ  (двойной клик — копировать значение)",
+                  style="Hdr.TLabel").pack(anchor="w", pady=(0, 3))
+        self.params = ttk.Treeview(left, columns=("k", "v"), show="headings",
+                                   style="Params.Treeview")
+        self.params.heading("k", text="Параметр")
+        self.params.heading("v", text="Значение")
+        self.params.column("k", width=190, stretch=False)
+        self.params.column("v", width=420)
+        self.params.pack(fill="both", expand=True)
+        self.params.bind("<Double-1>", self._copy_param)
 
-        # -- память
-        f_mem = ttk.Frame(self.nb)
-        mcols = ("addr", "data")
-        self.mem = ttk.Treeview(f_mem, columns=mcols, show="headings")
-        self.mem.heading("addr", text="Блок / страницы")
-        self.mem.heading("data", text="Данные (hex)")
-        self.mem.column("addr", width=150, stretch=False)
-        self.mem.column("data", width=700)
-        sbm = ttk.Scrollbar(f_mem, orient="vertical", command=self.mem.yview)
-        self.mem.configure(yscrollcommand=sbm.set)
-        self.mem.pack(side="left", fill="both", expand=True)
-        sbm.pack(side="right", fill="y")
-        self.nb.add(f_mem, text="  Память  ")
+        # правая колонка — вкладки
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.nb = ttk.Notebook(right)
+        self.nb.pack(fill="both", expand=True)
 
-        # -- журнал
-        f_log = ttk.Frame(self.nb)
-        self.log = tk.Text(f_log, wrap="word", state="disabled",
-                           font=("Consolas", 10), bg="#fbfaf6",
-                           relief="flat", padx=8, pady=6)
-        self.log.tag_configure("ok", foreground=C_OK)
-        self.log.tag_configure("warn", foreground=C_WARN)
-        self.log.tag_configure("err", foreground=C_ERR)
-        self.log.tag_configure("info", foreground="#33475a")
-        self.log.tag_configure("time", foreground="#9aa7b1")
-        slb = ttk.Scrollbar(f_log, orient="vertical", command=self.log.yview)
-        self.log.configure(yscrollcommand=slb.set)
-        self.log.pack(side="left", fill="both", expand=True)
-        slb.pack(side="right", fill="y")
-        self.nb.add(f_log, text="  Журнал  ")
+        # --- Память
+        mem_tab = ttk.Frame(self.nb)
+        self.nb.add(mem_tab, text="  Память  ")
+        search_bar = ttk.Frame(mem_tab)
+        search_bar.pack(fill="x", pady=(6, 4))
+        ttk.Label(search_bar, text="Поиск в дампе:",
+                  style="Hdr.TLabel").pack(side="left")
+        self.search_var = tk.StringVar()
+        ttk.Entry(search_bar, textvariable=self.search_var, width=26,
+                  style="Acc.TEntry").pack(side="left", padx=6)
+        self.search_mode = tk.StringVar(value="ascii")
+        ttk.Radiobutton(search_bar, text="ASCII", variable=self.search_mode,
+                        value="ascii").pack(side="left")
+        ttk.Radiobutton(search_bar, text="Hex", variable=self.search_mode,
+                        value="hex").pack(side="left", padx=(2, 6))
+        ttk.Button(search_bar, text="Найти", command=self.on_search).pack(side="left")
+        ttk.Button(search_bar, text="Сброс", command=self.on_search_reset).pack(side="left", padx=4)
+        self.search_lbl = ttk.Label(search_bar, text="", foreground="#5d7a8f")
+        self.search_lbl.pack(side="left", padx=10)
 
-    def _build_statusbar(self):
-        bar = ttk.Frame(self.root, padding=(10, 6))
+        self.mem = ttk.Treeview(mem_tab, columns=("blk", "hex", "note"),
+                                show="headings", style="Mem.Treeview")
+        self.mem.heading("blk", text="Блок / строка")
+        self.mem.heading("hex", text="Данные (hex)")
+        self.mem.heading("note", text="Примечание")
+        self.mem.column("blk", width=150, stretch=False)
+        self.mem.column("hex", width=430)
+        self.mem.column("note", width=220)
+        for tag, color in TAG_COLORS.items():
+            self.mem.tag_configure(tag, background=color)
+        self.mem.pack(fill="both", expand=True, pady=(0, 6))
+
+        # --- ATR
+        atr_tab = ttk.Frame(self.nb)
+        self.nb.add(atr_tab, text="  ATR  ")
+        ttk.Label(atr_tab, text="Побайтовый разбор ответа на сброс",
+                  style="Hdr.TLabel").pack(anchor="w", pady=(6, 3))
+        self.atr = ttk.Treeview(atr_tab, columns=("name", "hex", "det"),
+                                show="headings", style="Atr.Treeview")
+        self.atr.heading("name", text="Символ")
+        self.atr.heading("hex", text="Hex")
+        self.atr.heading("det", text="Значение")
+        self.atr.column("name", width=80, stretch=False)
+        self.atr.column("hex", width=70, stretch=False)
+        self.atr.column("det", width=560)
+        self.atr.pack(fill="both", expand=True, pady=(0, 6))
+
+        # --- Журнал
+        log_tab = ttk.Frame(self.nb)
+        self.nb.add(log_tab, text="  Журнал  ")
+        log_tab.configure(style="Dark.TFrame")
+        self.logview = ttk.Treeview(log_tab, columns=("t", "msg"),
+                                    show="headings", style="Log.Treeview")
+        self.logview.heading("t", text="Время")
+        self.logview.heading("msg", text="Событие")
+        self.logview.column("t", width=90, stretch=False)
+        self.logview.column("msg", width=620)
+        for level, color in (("ok", LED_GREEN), ("warn", AMBER),
+                             ("err", ACC), ("info", "#9fb3c0")):
+            self.logview.tag_configure(level, foreground=color)
+        self.logview.pack(fill="both", expand=True, padx=2, pady=(2, 6))
+
+    # ------------------------------------------------- статус-бар
+    def _statusbar(self):
+        bar = tk.Frame(self, background=INK, height=34)
         bar.pack(fill="x", side="bottom")
+        bar.pack_propagate(False)
 
-        self.led = tk.Canvas(bar, width=14, height=14, highlightthickness=0)
-        self.led.pack(side="left")
-        self.led_id = self.led.create_oval(2, 2, 12, 12, fill="#b8c1c8",
+        self.led = tk.Canvas(bar, width=14, height=14, bg=INK,
+                             highlightthickness=0)
+        self.led_id = self.led.create_oval(2, 2, 12, 12, fill=LED_GRAY,
                                            outline="")
+        self.led.pack(side="left", padx=(12, 6), pady=9)
 
-        self.status_var = tk.StringVar(
-            value="Готово. Выберите ридер и нажмите «Сканировать карту».")
-        ttk.Label(bar, textvariable=self.status_var,
-                  font=("Segoe UI", 9)).pack(side="left", padx=(8, 14))
+        self.status_var = tk.StringVar(value="Готово.")
+        tk.Label(bar, textvariable=self.status_var, bg=INK, fg="#d7e3ea",
+                 font=("Segoe UI", 9)).pack(side="left")
 
-        self.count_var = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.count_var,
-                  font=("Consolas", 9)).pack(side="right")
+        self.counter_var = tk.StringVar(value="")
+        tk.Label(bar, textvariable=self.counter_var, bg=INK, fg=AMBER,
+                 font=("Consolas", 9, "bold")).pack(side="right", padx=12)
 
-        self.progress = ttk.Progressbar(bar, length=240, mode="determinate",
-                                        style="Accent.Horizontal.TProgressbar")
-        self.progress.pack(side="right", padx=(0, 10))
+        self.progress = ttk.Progressbar(bar, length=180, mode="indeterminate")
+        self.progress.pack(side="right", padx=10, pady=9)
 
-    # -------------------------------------------------------------- команды
-    def refresh_readers(self):
-        names = [str(r) for r in readers()]
-        self.combo["values"] = names
+    def set_led(self, on):
+        self.led.itemconfig(self.led_id, fill=LED_GREEN if on else LED_GRAY)
+
+    # ------------------------------------------------- события из потока
+    def _poll(self):
+        try:
+            while True:
+                ev = self.queue.get_nowait()
+                self._handle(ev)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+    def _handle(self, ev):
+        kind = ev[0]
+        if kind == "param":
+            self.add_param(ev[1], ev[2])
+        elif kind == "log":
+            self.log(ev[1], ev[2])
+        elif kind == "mem":
+            self.add_mem(ev[1], ev[2], ev[3], ev[4])
+        elif kind == "atr":
+            self.fill_atr(ev[1])
+        elif kind == "status":
+            self.status_var.set(ev[1])
+        elif kind == "count":
+            self.counter_var.set(ev[1])
+        elif kind == "busy":
+            self.working = ev[1]
+            self.scan_btn.configure(state="disabled" if ev[1] else "normal")
+            if ev[1]:
+                self.set_led(True)
+                self.progress.start(12)
+            else:
+                self.set_led(False)
+                self.progress.stop()
+        elif kind == "fatal":
+            self.log("err", ev[1])
+            self.status_var.set("Ошибка — подробности в журнале.")
+
+    # ------------------------------------------------- наполнение
+    def add_param(self, k, v):
+        self.report[k] = v
+        self.params.insert("", "end", values=(k, v))
+        self.params.yview_moveto(1.0)
+
+    def add_mem(self, label, hexstr, note, tag="plain"):
+        self.mem_hex[label] = hexstr
+        iid = self.mem.insert("", "end", values=(label, hexstr, note),
+                              tags=(tag,))
+        self.mem_tags[iid] = tag
+        self.mem.yview_moveto(1.0)
+
+    def fill_atr(self, rows):
+        for row in self.atr.get_children():
+            self.atr.delete(row)
+        for name, hexs, det in rows:
+            self.atr.insert("", "end", values=(name, hexs, det))
+
+    def log(self, level, text):
+        t = datetime.now().strftime("%H:%M:%S")
+        self.logview.insert("", "end", values=(t, text), tags=(level,))
+        self.logview.yview_moveto(1.0)
+
+    def _copy_param(self, _event=None):
+        sel = self.params.selection()
+        if not sel:
+            return
+        k, v = self.params.item(sel[0], "values")
+        self.clipboard_clear()
+        self.clipboard_append(v)
+        self.log("info", "Скопировано: %s = %s" % (k, v))
+
+    # ------------------------------------------------- действия
+    def on_refresh(self):
+        names = [str(r) for r in core.find_readers()]
+        self.reader_box["values"] = names
         if names:
-            self.combo.current(0)
-            self._log("info", "Найдено ридеров: %d" % len(names))
+            self.reader_box.current(0)
+            self.log("info", "Найдено ридеров: %d" % len(names))
         else:
-            self.status_var.set(
-                "Ридеры не найдены. Проверьте драйвер ACS CCID и службу SCardSvr.")
+            self.log("err", "Ридеры не найдены — драйвер / служба «Смарт-карта».")
 
-    def clear(self):
-        for w in (self.params, self.mem):
-            for iid in w.get_children():
-                w.delete(iid)
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-        self.progress["value"] = 0
-        self.report, self.memory, self.errors = {}, {}, []
-        self.memory_title = ""
-        self.count_var.set("")
-        self.save_btn.configure(state="disabled")
-        self._led("idle")
-        self.status_var.set("Очищено.")
-
-    def scan(self):
-        if self.busy:
-            return
+    def on_scan(self):
         name = self.reader_var.get()
-        if not name:
-            messagebox.showwarning("ACR1281U", "Ридер не выбран.")
+        if not name or self.working:
             return
-        self.clear()
-        self.busy = True
-        self.scan_btn.configure(state="disabled")
-        self.status_var.set("Чтение карты…")
-        self._led("busy")
-        threading.Thread(target=self._worker, args=(name,),
-                         daemon=True).start()
+        for tree in (self.params, self.mem, self.atr):
+            for row in tree.get_children():
+                tree.delete(row)
+        for iid in list(self.mem_tags):
+            del self.mem_tags[iid]
+        self.report, self.mem_hex, self.errors = {}, {}, []
+        self.mem_tags = {}
+        self.memory_title = ""
+        self.atr_bytes = []
+        self.search_lbl.configure(text="")
+        self.queue.put(("busy", True))
+        self.queue.put(("status", "Чтение карты…"))
+        threading.Thread(target=self._worker, args=(name,), daemon=True).start()
 
-    # --------------------------------------------------------------- worker
+    # ------------------------------------------------- фоновое чтение
     def _worker(self, reader_name):
-        send = self.q.put
+        send = self.queue.put
         conn = None
         try:
-            found = [r for r in readers() if str(r) == reader_name]
-            if not found:
-                send(("log", "err", "Ридер исчез из системы — нажмите «Обновить»."))
+            from smartcard.System import readers as pcsc_readers
+            reader = None
+            for r in pcsc_readers():
+                if str(r) == reader_name:
+                    reader = r
+                    break
+            if reader is None:
+                send(("fatal", "Ридер «%s» исчез из системы." % reader_name))
                 return
-            reader = found[0]
-            send(("status", "Подключение: %s…" % reader_name))
+
             conn = reader.createConnection()
             conn.connect(CardConnection.T0_protocol | CardConnection.T1_protocol)
             send(("log", "ok", "Подключено: " + reader_name))
 
-            self.report = {}
-            self.memory = {}
-            self.errors = []
-            self.memory_title = ""
-            self.atr = []
-
-            def add(key, value):
-                self.report[key] = value
-                send(("param", key, value))
+            def add(k, v):
+                self.report[k] = v
+                send(("param", k, v))
 
             def tx(apdu):
                 try:
@@ -260,35 +458,74 @@ class Gui:
                     send(("log", "err", "Сбой обмена APDU: %s" % exc))
                     return [], 0x6F00
 
-            proto = {0: "direct", 1: "T=0", 2: "T=1",
-                     3: "T=0+T=1"}.get(conn.getProtocol(), "?")
             add("Ридер", str(reader))
             add("Интерфейс", core.interface_of(reader))
-            add("Протокол", proto)
+            add("Протокол", {0: "direct", 1: "T=0", 2: "T=1",
+                             3: "T=0+T=1"}.get(conn.getProtocol(), "?"))
             add("Python", sys.version.split()[0])
+
             try:
-                atr = conn.getATR()
-                self.atr = atr
-                add("ATR", core.hx(atr))
-                note = atr_note(atr)
-                if note:
-                    add("ATR — заметка", note)
-                    send(("log", "info", "ATR: " + note))
+                self.atr_bytes = list(conn.getATR() or [])
             except SmartcardException as exc:
-                add("ATR", "-")
+                self.atr_bytes = []
                 self.errors.append("getATR: %s" % exc)
+            add("ATR", core.hx(self.atr_bytes))
+            send(("atr", atr_decode(self.atr_bytes)))
+            send(("log", "info", "ATR: %d байт — разбор на вкладке «ATR»"
+                  % len(self.atr_bytes)))
 
+            # ---------------- UID
+            uid, sw = tx(core.GET_UID)
+            if sw == 0x9000 and uid:
+                add("UID", core.hx(uid))
+                add("Длина UID", "%d байт" % len(uid))
+                send(("log", "info", "UID: " + core.hx(uid)))
+
+            # ---------------- тип карты: polling, затем ATR
             contact = core._is_icc(reader)
-            sak = self._poll(tx, add, send)
+            sak = None
+            data, sw = tx(core.PICC_POLL)
+            if sw == 0x9000 and len(data) >= 7 and data[0] == 0xD5 and data[2] > 0:
+                sens, sak = data[3:5], data[5]
+                add("ATQA (SENS_RES)", core.hx(sens))
+                add("SAK (SEL_RES)", "%02X" % sak)
+                add("Тип карты", core.SAK_TYPES.get(
+                    sak, "неизвестен (SAK=%02X)" % sak))
+                add("Источник типа", "из Polling D4 4A")
+                send(("log", "ok", "Тип карты: " +
+                      core.SAK_TYPES.get(sak, "SAK=%02X" % sak)))
+            elif not contact:
+                add("ATQA (SENS_RES)", "- (polling вернул 0 целей)")
+                add("SAK (SEL_RES)", "- (polling вернул 0 целей)")
+                before = set(self.report)
+                sak = core.detect_from_atr(self.atr_bytes, self.report)
+                for k in ("Код карты (ACS)", "Тип карты", "Источник типа"):
+                    if k in self.report and k not in before:
+                        send(("param", k, self.report[k]))
+                if sak is not None:
+                    send(("log", "ok", "Тип карты: %s (из ATR, H10-H11)"
+                          % self.report.get("Тип карты")))
+                else:
+                    add("Тип карты", "не определён (нет ни polling, ни кода в ATR)")
 
+            data, sw = tx(core.PICC_STATUS)
+            if sw == 0x9000 and len(data) >= 5:
+                modes = {0x00: "авто", 0x01: "106 кбит/с", 0x02: "212 кбит/с",
+                         0x04: "424 кбит/с", 0x08: "848 кбит/с"}
+                add("Режим PICC", modes.get(data[2], "%02X" % data[2]))
+
+            if sak in (0x20, 0x28):
+                ats, sw = tx(core.GET_ATS)
+                if sw == 0x9000 and ats:
+                    add("ATS", core.hx(ats))
+
+            # ---------------- память
             if sak in (0x08, 0x09, 0x18):
-                send(("status", "Чтение секторов Mifare…"))
-                self._mifare(tx, sak, add, send)
                 self.memory_title = "ПАМЯТЬ - БЛОКИ MIFARE (hex)"
+                self._mifare(tx, sak, add, send)
             elif sak == 0x00:
-                send(("status", "Чтение страниц NTAG / Ultralight…"))
-                self._ntag(tx, add, send)
                 self.memory_title = "ПАМЯТЬ - СТРАНИЦЫ NTAG / ULTRALIGHT (hex)"
+                self._ntag(tx, add, send)
             elif contact:
                 send(("status", "Поиск EMV-приложений (PPSE)…"))
                 self._emv(tx, add, send)
@@ -297,75 +534,27 @@ class Gui:
                 add("Ошибок при чтении", str(len(self.errors)))
             send(("log", "ok",
                   "Готово. Параметров: %d, строк памяти: %d, ошибок: %d"
-                  % (len(self.report), len(self.memory), len(self.errors))))
+                  % (len(self.report), len(self.mem_hex), len(self.errors))))
+            send(("status", "Готово. «Сохранить отчёт…» — файлы .txt и .json."))
         except NoCardException:
-            send(("log", "err", "Карта не обнаружена — положите её на ридер."))
+            send(("fatal", "Карта не обнаружена — положите её на ридер."))
         except CardConnectionException as exc:
-            send(("log", "err", "Ошибка соединения: %s" % exc))
+            send(("fatal", "Ошибка соединения: %s" % exc))
         except SmartcardException as exc:
-            send(("log", "err", "Ошибка PC/SC: %s" % exc))
+            send(("fatal", "Ошибка PC/SC: %s" % exc))
+        except Exception as exc:  # страховка: окно не должно падать
+            send(("fatal", "Непредвиденная ошибка: %s" % exc))
         finally:
             if conn is not None:
                 try:
                     conn.disconnect()
                 except SmartcardException:
                     pass
-            send(("done",))
-
-    def _poll(self, tx, add, send):
-        uid, sw = tx(core.GET_UID)
-        if sw == 0x9000 and uid:
-            add("UID", core.hx(uid))
-            add("Длина UID", "%d байт" % len(uid))
-            send(("log", "info", "UID: " + core.hx(uid)))
-
-        sak = None
-        data, sw = tx(core.PICC_POLL)
-        if sw == 0x9000 and len(data) >= 7 and data[0] == 0xD5 and data[2] > 0:
-            sens, sak = data[3:5], data[5]
-            nlen = data[6]
-            add("ATQA (SENS_RES)", core.hx(sens))
-            add("SAK (SEL_RES)", "%02X" % sak)
-            add("Тип карты", core.SAK_TYPES.get(sak,
-                                                "неизвестен (SAK=%02X)" % sak))
-            add("Источник типа", "из Polling D4 4A")
-            if nlen:
-                add("NFCID", core.hx(data[7:7 + nlen]))
-            send(("log", "ok", "Тип карты: " +
-                  core.SAK_TYPES.get(sak, "SAK=%02X" % sak)))
-        else:
-            add("ATQA (SENS_RES)", "- (polling вернул 0 целей)")
-            add("SAK (SEL_RES)", "- (polling вернул 0 целей)")
-            # Резервный канал: тип зашит в синтетическом ATR ридера.
-            atr = getattr(self, "atr", []) or []
-            if len(atr) >= 15 and list(atr[:12]) == core.ACS_ATR_PREFIX:
-                code = (atr[13] << 8) | atr[14]
-                add("Код карты (ACS)", "%04X" % code)
-                hit = core.ACS_CARD_CODES.get(code)
-                if hit:
-                    name, sak = hit
-                    add("Тип карты", name)
-                    add("Источник типа", "из ATR (байты H10-H11, polling молчал)")
-                    send(("log", "ok", "Тип карты: %s (из ATR)" % name))
-                else:
-                    add("Тип карты", "не определён (код %04X не в таблице)" % code)
-            else:
-                add("Тип карты", "не определён (нет ни polling, ни кода в ATR)")
-
-        data, sw = tx(core.PICC_STATUS)
-        if sw == 0x9000 and len(data) >= 5:
-            modes = {0x00: "авто", 0x01: "106 кбит/с", 0x02: "212 кбит/с",
-                     0x04: "424 кбит/с", 0x08: "848 кбит/с"}
-            add("Режим PICC", modes.get(data[2], "%02X" % data[2]))
-
-        if sak in (0x20, 0x28):
-            ats, sw = tx(core.GET_ATS)
-            if sw == 0x9000 and ats:
-                add("ATS", core.hx(ats))
-        return sak
+            send(("busy", False))
 
     def _mifare(self, tx, sak, add, send):
         sectors = {0x18: 40, 0x09: 5}.get(sak, 16)
+        send(("status", "Чтение секторов Mifare…"))
         read_ok = keys_ok = total = 0
         for sec in range(sectors):
             if sectors == 40 and sec >= 32:
@@ -385,38 +574,51 @@ class Gui:
                     break
             if not opened:
                 send(("log", "warn", "Сектор %02d · ключ не подошёл" % sec))
-            else:
-                for i in range(count):
-                    data, sw = tx(core.READ_BLOCK(first + i))
-                    if sw == 0x9000:
-                        name = "Блок %03d" % (first + i)
-                        self.memory[name] = core.hx(data)
-                        send(("mem", name, core.hx(data)))
-                        read_ok += 1
-            send(("progress", (sec + 1) / float(sectors)))
+                send(("mem", "Сектор %02d" % sec, "-", "ключ не подошёл", "fail"))
+                send(("count", "Сектора %d/%d · Блоки %d/%d"
+                      % (sec + 1, sectors, read_ok, total)))
+                continue
+            per = 16 if count == 16 else 4
+            for i in range(count):
+                blk = first + i
+                data, sw = tx(core.READ_BLOCK(blk))
+                is_trailer = (i == per - 1)
+                note = ("трейлер (ключи/AC)" if is_trailer
+                        else "сектор %02d · ключ A" % sec)
+                tag = "trailer" if is_trailer else "ok"
+                if sw == 0x9000:
+                    read_ok += 1
+                    self.add_mem("Блок %03d" % blk, core.hx(data), note, tag)
+                    send(("mem", "Блок %03d" % blk, core.hx(data), note, tag))
+                else:
+                    self.add_mem("Блок %03d" % blk, "-", "ошибка чтения", "fail")
+                    send(("mem", "Блок %03d" % blk, "-", "ошибка чтения", "fail"))
             send(("count", "Сектора %d/%d · Блоки %d/%d"
                   % (sec + 1, sectors, read_ok, total)))
         add("Прочитано блоков", "%d / %d" % (read_ok, total))
         add("Секторов с ключом", "%d / %d" % (keys_ok, sectors))
 
     def _ntag(self, tx, add, send):
+        send(("status", "Чтение страниц NTAG / Ultralight…"))
         got = 0
-        for n, start in enumerate((0x00, 0x04, 0x08, 0x0C)):
+        for start in (0x00, 0x04, 0x08, 0x0C):
             data, sw = tx(core.READ_BLOCK(start))
+            label = "Стр. %02X-%02X" % (start, start + 3)
             if sw == 0x9000:
-                name = "Стр. %02X-%02X" % (start, start + 3)
-                self.memory[name] = core.hx(data)
-                send(("mem", name, core.hx(data)))
                 got += 1
-            send(("progress", (n + 1) / 4.0))
+                self.add_mem(label, core.hx(data), "без аутентификации", "ok")
+                send(("mem", label, core.hx(data), "без аутентификации", "ok"))
+            else:
+                self.add_mem(label, "-", "не читается", "fail")
+                send(("mem", label, "-", "не читается", "fail"))
+            send(("count", "Страницы %d/4" % got))
         if got:
             add("Страниц прочитано", "%d по 4 (00-0F), 16 байт" % got)
 
     def _emv(self, tx, add, send):
         ppse = [0x00, 0xA4, 0x04, 0x00, 0x0E] + list(b"1PAY.SYS.DDF01")
         if tx(ppse)[1] != 0x9000:
-            send(("log", "warn",
-                  "PPSE недоступен — карта не EMV или не отвечает на SELECT."))
+            send(("log", "warn", "PPSE не ответил — EMV-каталог недоступен."))
             return
         n = 0
         for rec in range(1, 11):
@@ -428,93 +630,160 @@ class Gui:
                 tag, ln = data[i], data[i + 1]
                 if tag == 0x4F and i + 2 + ln <= len(data):
                     n += 1
-                    add("Приложение %d (AID)" % n,
-                        core.hx(data[i + 2:i + 2 + ln]))
-                    send(("log", "ok", "AID: " + core.hx(data[i + 2:i + 2 + ln])))
+                    add("Приложение %d (AID)" % n, core.hx(data[i + 2:i + 2 + ln]))
+                    send(("log", "ok", "EMV AID: " + core.hx(data[i + 2:i + 2 + ln])))
                     break
                 i += 2 + ln
-        if n == 0:
-            send(("log", "warn", "Приложения в PPSE не найдены."))
 
-    # ----------------------------------------------------------------- вывод
-    def _pump(self):
-        try:
-            while True:
-                ev = self.q.get_nowait()
-                kind = ev[0]
-                if kind == "log":
-                    self._log(ev[1], ev[2])
-                elif kind == "param":
-                    self.params.insert("", "end", values=(ev[1], ev[2]))
-                    self.params.yview_moveto(1)
-                elif kind == "mem":
-                    self.mem.insert("", "end", values=(ev[1], ev[2]))
-                elif kind == "progress":
-                    self.progress["value"] = ev[1] * 100
-                elif kind == "count":
-                    self.count_var.set(ev[1])
-                elif kind == "status":
-                    self.status_var.set(ev[1])
-                elif kind == "done":
-                    self.busy = False
-                    self.scan_btn.configure(state="normal")
-                    self.save_btn.configure(
-                        state="normal" if self.report else "disabled")
-                    self._led("ok" if self.report else "err")
-                    if self.report:
-                        self.status_var.set(
-                            "Готово. «Сохранить отчёт…» — файлы .txt и .json.")
-                    else:
-                        self.status_var.set("Не удалось прочитать. Смотрите журнал.")
-        except queue.Empty:
-            pass
-        self.root.after(90, self._pump)
+    # ------------------------------------------------- поиск по дампу
+    def _mem_blob(self):
+        blob = bytearray()
+        spans = []  # (start, end, iid)
+        for iid in self.mem.get_children():
+            label, hexstr, _ = self.mem.item(iid, "values")
+            h = re.sub(r"[^0-9a-fA-F]", "", hexstr)
+            try:
+                raw = bytes.fromhex(h)
+            except ValueError:
+                continue
+            if not raw:
+                continue
+            spans.append((len(blob), len(blob) + len(raw), iid))
+            blob += raw
+        return bytes(blob), spans
 
-    def _log(self, tag, text):
-        stamp = datetime.now().strftime("%H:%M:%S")
-        self.log.configure(state="normal")
-        self.log.insert("end", stamp + "  ", "time")
-        self.log.insert("end", text + "\n", tag)
-        self.log.configure(state="disabled")
-        self.log.see("end")
+    def on_search(self):
+        q = self.search_var.get().strip()
+        if not q:
+            self.search_lbl.configure(text="введите номер / строку / hex")
+            return
+        if self.search_mode.get() == "hex":
+            h = re.sub(r"[^0-9a-fA-F]", "", q)
+            if len(h) % 2:
+                h += "0"
+            try:
+                needle = bytes.fromhex(h)
+            except ValueError:
+                self.search_lbl.configure(text="некорректный hex")
+                return
+        else:
+            needle = q.encode("latin-1", "ignore")
+        if not needle:
+            self.search_lbl.configure(text="пустой запрос")
+            return
 
-    def _led(self, state):
-        color = {"busy": "#f2a51b", "ok": "#2ebd6b",
-                 "err": "#e8501d"}.get(state, "#b8c1c8")
-        self.led.itemconfigure(self.led_id, fill=color)
+        blob, spans = self._mem_blob()
+        if not blob:
+            self.search_lbl.configure(text="в памяти пока пусто")
+            return
 
-    def save(self):
+        hits, pos = [], 0
+        while True:
+            pos = blob.find(needle, pos)
+            if pos < 0:
+                break
+            hits.append(pos)
+            pos += 1
+
+        for iid, tag in self.mem_tags.items():
+            self.mem.item(iid, tags=(tag,))
+        hit_rows = []
+        for off in hits:
+            for start, end, iid in spans:
+                if start <= off < end:
+                    self.mem.item(iid, tags=("hit",))
+                    if iid not in hit_rows:
+                        hit_rows.append(iid)
+                    break
+        if hits:
+            offs = ", ".join("0x%04X" % o for o in hits[:6])
+            if len(hits) > 6:
+                offs += "…"
+            self.search_lbl.configure(
+                text="найдено %d · строки: %d · смещения: %s"
+                % (len(hits), len(hit_rows), offs))
+            self.log("ok", "Поиск «%s»: %d совпадений (%s)" % (q, len(hits), offs))
+            if hit_rows:
+                self.mem.see(hit_rows[0])
+        else:
+            self.search_lbl.configure(
+                text="не найдено (%d байт запроса, %d байт в дампе)"
+                % (len(needle), len(blob)))
+            self.log("warn", "Поиск «%s»: совпадений нет." % q)
+
+    def on_search_reset(self):
+        for iid, tag in self.mem_tags.items():
+            self.mem.item(iid, tags=(tag,))
+        self.search_var.set("")
+        self.search_lbl.configure(text="")
+
+    # ------------------------------------------------- отчёты
+    def on_save(self):
         if not self.report:
+            self.log("warn", "Нечего сохранять — сначала прочитайте карту.")
             return
         uid = self.report.get("UID", "").replace(" ", "")[:14] or "CONTACT"
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default = "card_report_%s_%s.txt" % (uid, stamp)
+        default = "card_report_%s_%s.txt" % (
+            uid, datetime.now().strftime("%Y%m%d_%H%M%S"))
         path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Отчёт карты", "*.txt"), ("Все файлы", "*.*")],
-            initialfile=default)
+            defaultextension=".txt", initialfile=default,
+            filetypes=[("Отчёт", "*.txt"), ("Все файлы", "*.*")])
         if not path:
             return
-        core.ERRORS[:] = self.errors  # передаём ошибки в форматтер core
-        txt = core.build_txt(self.report, self.memory, self.memory_title)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(txt)
-        if path.lower().endswith(".txt"):
-            json_path = path[:-4] + ".json"
-        else:
-            json_path = path + ".json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump({"report": self.report, "memory": self.memory,
-                       "errors": self.errors}, f, ensure_ascii=False, indent=2)
-        self._log("ok", "Сохранено: " + path)
-        self._log("ok", "Сохранено: " + json_path)
-        self.status_var.set("Отчёт сохранён: " + path)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(core.build_txt(self.report, self.mem_hex,
+                                       self.memory_title or "ПАМЯТЬ (hex)"))
+            json_path = os.path.splitext(path)[0] + ".json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({"report": self.report, "memory": self.mem_hex,
+                           "errors": self.errors},
+                          f, ensure_ascii=False, indent=2)
+            self.log("ok", "Сохранено: %s (+ .json)" % os.path.basename(path))
+            self.status_var.set("Отчёт сохранён: " + os.path.basename(path))
+        except OSError as exc:
+            self.log("err", "Не удалось сохранить: %s" % exc)
+
+    def on_open(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Отчёты", "*.txt"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        for tree in (self.params, self.mem):
+            for row in tree.get_children():
+                tree.delete(row)
+        self.report, self.mem_hex = {}, {}
+        self.mem_tags = {}
+        section = None
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            self.log("err", "Не удалось открыть: %s" % exc)
+            return
+        for line in lines:
+            if line.startswith("[ ПАМЯТЬ"):
+                section = "mem"
+                continue
+            if line.startswith("["):
+                section = None
+                continue
+            m = re.match(r"\s+(.+?)\s*:\s(.*)$", line)
+            if not m:
+                continue
+            k, v = m.group(1).strip(), m.group(2).strip()
+            if section == "mem":
+                self.add_mem(k, v, "из файла", "plain")
+            else:
+                self.add_param(k, v)
+        self.log("info", "Открыт отчёт: %s (%d параметров)"
+                 % (os.path.basename(path), len(self.report)))
+        self.status_var.set("Открыт: " + os.path.basename(path))
 
 
 def main():
-    root = tk.Tk()
-    Gui(root)
-    root.mainloop()
+    app = App()
+    app.mainloop()
 
 
 if __name__ == "__main__":
