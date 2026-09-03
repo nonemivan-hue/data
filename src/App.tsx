@@ -3,6 +3,7 @@ import { PY_SOURCE } from "./data/sources";
 import ScannerPanel from "./components/ScannerPanel";
 import ProgramTabs from "./components/CodeViewer";
 import AtrParser from "./components/AtrParser";
+import GuiSection from "./components/GuiSection";
 import { CardsTable, CommandsTable, Faq, Footer, InstallSteps, ReportPreview, Ticker } from "./components/Sections";
 
 /* ---------- шапка ---------- */
@@ -27,6 +28,7 @@ function Header() {
             ["#program", "Программа"],
             ["#atr", "ATR"],
             ["#output", "Отчёт"],
+            ["#gui", "GUI"],
             ["#install", "Установка"],
             ["#cards", "Карты"],
             ["#faq", "FAQ"],
@@ -147,7 +149,7 @@ function InstallSection() {
       <div className="panel-grid mx-auto w-full max-w-6xl px-5 py-20 md:px-8 md:py-24">
         <SectionHead
           dark
-          num="04 / Установка · Windows"
+          num="05 / Установка · Windows"
           title="От нуля до первого чтения"
           sub="Пять шагов: Python, CCID-драйвер ридера, pyscard, файл скрипта и запуск. Команды копируются кликом."
         />
@@ -163,7 +165,7 @@ function CardsSection() {
     <section id="cards" ref={ref} className="scroll-mt-16">
       <div className="mx-auto w-full max-w-6xl px-5 py-20 md:px-8 md:py-24">
         <SectionHead
-          num="05 / Карты и команды"
+          num="06 / Карты и команды"
           title="Что умеет связка ACR1281U + скрипт"
           sub="Ридер двухинтерфейсный: верхняя площадка — бесконтактные ISO 14443 A/B и FeliCa, щель — контактные ISO 7816. Скрипт работает с обоими."
         />
@@ -190,7 +192,7 @@ function FaqSection() {
     <section id="faq" ref={ref} className="scroll-mt-16 border-t-2 border-ink bg-paper2/70">
       <div className="mx-auto w-full max-w-6xl px-5 py-20 md:px-8 md:py-24">
         <SectionHead
-          num="06 / Вопросы"
+          num="07 / Вопросы"
           title="Если что-то пошло не так"
           sub="Типичные ошибки PC/SC под Windows и их лечение — от «модуль не найден» до «сектора не читаются»."
         />
@@ -220,6 +222,7 @@ export default function App() {
         <ProgramSection />
         <AtrSection />
         <OutputSection />
+        <GuiSection />
         <InstallSection />
         <CardsSection />
         <FaqSection />
