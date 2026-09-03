@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import GUI_PY from "../../acr1281_gui.py?raw";
 import { PY_SOURCE, REQUIREMENTS_SOURCE, RUN_BAT_SOURCE } from "../data/sources";
 import { downloadFile, highlightPython, useCopy } from "../lib/ui";
 
@@ -73,7 +74,8 @@ export function CodeWindow({
    ============================================================ */
 
 const FILES = [
-  { name: "acr1281_dump.py", code: PY_SOURCE, py: true, note: "основной скрипт" },
+  { name: "acr1281_dump.py", code: PY_SOURCE, py: true, note: "консоль · v1.1" },
+  { name: "acr1281_gui.py", code: GUI_PY, py: true, note: "графический интерфейс" },
   { name: "requirements.txt", code: REQUIREMENTS_SOURCE, py: false, note: "зависимости" },
   { name: "run.bat", code: RUN_BAT_SOURCE, py: false, note: "запуск двойным кликом" },
 ];
