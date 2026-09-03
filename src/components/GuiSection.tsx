@@ -201,7 +201,7 @@ export default function GuiSection() {
     <section id="gui" ref={ref} className="scroll-mt-16 border-y-2 border-ink bg-paper2/70">
       <div className="mx-auto w-full max-w-6xl px-5 py-20 md:px-8 md:py-24">
         <SectionHead
-          num="04 / Графический интерфейс"
+          num="05 / Графический интерфейс"
           title="Тот же скрипт — но с окном и кнопками"
           sub="acr1281_gui.py оборачивает логику v1.1 в окно tkinter: выбор ридера, сканирование, живая таблица параметров, журнал и сохранение отчёта. Консоль больше не нужна — а файлы результата те же: «параметр : значение» и JSON."
         />
