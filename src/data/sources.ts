@@ -14,6 +14,7 @@ acr1281_dump.py — полное чтение параметров карты ч
 Что читает:
   * ATR, протокол T=0/T=1, исторические байты (контактные и бесконтактные)
   * UID, ATQA (SENS_RES), SAK (SEL_RES), тип карты   — Polling D4 4A
+  * тип карты из синтетического ATR, когда polling молчит  — байты H10-H11
   * статус PICC (режим, скорость)                    — D4 32
   * ATS для карт ISO 14443-4                         — FF CA 01 00
   * Mifare Classic 1K/4K/Mini: все сектора заводскими ключами
@@ -21,14 +22,19 @@ acr1281_dump.py — полное чтение параметров карты ч
   * контактные EMV-карты: список приложений из PPSE (1PAY.SYS.DDF01)
 
 История версий:
-  v1.1 — аппаратные ошибки обмена (0x1F «устройство не работает» и др.)
-         больше не валят скрипт: фиксируются в секции «Ошибки» отчёта;
-         автоперебор интерфейсов PICC -> ICC; чтение NTAG/Ultralight;
-         в отчёте появляются «Интерфейс», «ATS», «Python».
+  v1.2 — исправлено ложное срабатывание «ICC внутри PICC» (интерфейсы теперь
+         различаются по границе слова); если polling не вернул целей, тип
+         карты определяется по синтетическому ATR (байты H10-H11, коды ACS),
+         и чтение секторов Mifare продолжается; PPSE/EMV отправляются только
+         на реально контактном интерфейсе.
+  v1.1 — аппаратные ошибки обмена (0x1F) больше не валят скрипт: попадают в
+         секцию «Ошибки»; автоперебор интерфейсов PICC -> ICC; чтение
+         NTAG/Ultralight; параметры «Интерфейс», «ATS», «Python».
   v1.0 — первый выпуск.
 """
 
 import json
+import re
 import sys
 from datetime import datetime
 
@@ -37,7 +43,7 @@ from smartcard.CardConnection import CardConnection
 from smartcard.Exceptions import (CardConnectionException, NoCardException,
                                   SmartcardException)
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 # ------------------------------------------------------------- APDU-команды
 GET_UID     = [0xFF, 0xCA, 0x00, 0x00, 0x00]                          # UID карты
@@ -64,6 +70,32 @@ SAK_TYPES = {
     0x28: "SmartMX / JCOP (ISO 14443-4 + Mifare)",
 }
 
+# Синтетический ATR ридеров ACS: тип карты зашит в байтах H10-H11.
+# Используется, когда polling D4 4A вернул 0 целей (карта уже активирована
+# PC/SC-слоем, PN532 не отдаёт её повторно).
+ACS_ATR_PREFIX = [0x3B, 0x8F, 0x80, 0x01, 0x80, 0x4F, 0x0C,
+                  0xA0, 0x00, 0x00, 0x03, 0x06]
+
+# код ACS -> (название, эквивалент SAK для маршрутизации чтения)
+ACS_CARD_CODES = {
+    0x0001: ("Mifare Classic 1K",   0x08),
+    0x0002: ("Mifare Classic 4K",   0x18),
+    0x0010: ("Mifare Mini",         0x09),
+    0x0003: ("Mifare Ultralight",   0x00),
+    0x0029: ("NTAG210",             0x00),
+    0x002A: ("NTAG212",             0x00),
+    0x002B: ("NTAG213",             0x00),
+    0x002C: ("NTAG215",             0x00),
+    0x002D: ("NTAG216",             0x00),
+    0x0020: ("Mifare DESFire",      0x20),
+    0x0023: ("Mifare DESFire EV1 2K", 0x20),
+    0x0024: ("Mifare DESFire EV1 4K", 0x20),
+    0x0025: ("Mifare DESFire EV1 8K", 0x20),
+    0x0026: ("Mifare Plus",         0x20),
+    0xF004: ("Topaz / Jewel",       None),
+    0xF011: ("FeliCa 212K",         None),
+}
+
 ERRORS = []  # ошибки обмена, не прерывающие чтение
 
 
@@ -82,6 +114,16 @@ def transmit(conn, apdu):
         return [], 0x6F00
 
 
+# ---------------------------------------------------------------- интерфейсы
+def _is_picc(name):
+    return re.search(r"\\bPICC\\b", str(name), re.I) is not None
+
+
+def _is_icc(name):
+    # \\bICC\\b НЕ совпадает со словом «PICC» (между P и ICC нет границы слова)
+    return re.search(r"\\bICC\\b", str(name), re.I) is not None
+
+
 def find_readers():
     """Ридеры ACR1281U (PICC первыми, затем ICC), иначе все PC/SC-ридеры."""
     found = readers()
@@ -89,19 +131,18 @@ def find_readers():
         sys.exit("[!] Ридеры не найдены. Проверьте драйвер ACS CCID "
                  "и службу Windows «Смарт-карта» (scardsvr).")
     prefs = [r for r in found if "1281" in str(r).upper()] or found
-    picc = [r for r in prefs if "PICC" in str(r).upper()]
-    icc = [r for r in prefs if "ICC" in str(r).upper()]
+    picc = [r for r in prefs if _is_picc(r)]
+    icc = [r for r in prefs if _is_icc(r)]
     rest = [r for r in prefs if r not in picc and r not in icc]
     return picc + icc + rest
 
 
 def interface_of(name):
-    n = str(name).upper()
-    if "PICC" in n:
+    if _is_picc(name):
         return "PICC — бесконтактный (RF 13.56 МГц)"
-    if "ICC" in n:
+    if _is_icc(name):
         return "ICC — контактный (слот смарт-карты)"
-    if "SAM" in n:
+    if "SAM" in str(name).upper():
         return "SAM-слот"
     return "PC/SC"
 
@@ -126,6 +167,21 @@ def connect_any():
              % ("\\n    Последняя ошибка: %s" % last_err if last_err else ""))
 
 
+# ------------------------------------------------------------------- чтение
+def detect_from_atr(atr, report):
+    """Тип карты из синтетического ATR ACS (байты H10-H11). Возвращает SAK."""
+    if len(atr) >= 15 and list(atr[:12]) == ACS_ATR_PREFIX:
+        code = (atr[13] << 8) | atr[14]
+        report["Код карты (ACS)"] = "%04X" % code
+        hit = ACS_CARD_CODES.get(code)
+        if hit:
+            name, sak = hit
+            report["Тип карты"] = name
+            report["Источник типа"] = "из ATR (байты H10-H11, polling молчал)"
+            return sak
+    return None
+
+
 def poll_card(conn, report):
     """Бесконтактная часть: UID, ATQA, SAK, тип, ATS. Возвращает SAK/None."""
     uid, sw = transmit(conn, GET_UID)
@@ -142,12 +198,20 @@ def poll_card(conn, report):
         report["ATQA (SENS_RES)"] = hx(sens)
         report["SAK (SEL_RES)"] = "%02X" % sak
         report["Тип карты"] = SAK_TYPES.get(sak, "неизвестен (SAK=%02X)" % sak)
+        report["Источник типа"] = "из Polling D4 4A"
         if nlen:
             report["NFCID"] = hx(data[7:7 + nlen])
     else:
-        report["ATQA (SENS_RES)"] = "-"
-        report["SAK (SEL_RES)"] = "-"
-        report["Тип карты"] = "не ISO 14443 (вероятно, контактная)"
+        report["ATQA (SENS_RES)"] = "- (polling вернул 0 целей)"
+        report["SAK (SEL_RES)"] = "- (polling вернул 0 целей)"
+        # Резервный канал: тип зашит в синтетическом ATR ридера.
+        try:
+            atr = conn.getATR() or []
+        except SmartcardException:
+            atr = []
+        sak = detect_from_atr(atr, report)
+        if sak is None:
+            report["Тип карты"] = "не определён (нет ни polling, ни кода в ATR)"
 
     data, sw = transmit(conn, PICC_STATUS)
     if sw == 0x9000 and len(data) >= 5:
@@ -293,7 +357,7 @@ def main():
     memory = {}
     memory_title = ""
     try:
-        contact = "ICC" in str(reader).upper()
+        contact = _is_icc(reader)
         sak = poll_card(conn, report)
 
         if sak in (0x08, 0x09, 0x18):
@@ -304,8 +368,9 @@ def main():
             print("[*] NTAG / Ultralight: читаю страницы...")
             memory = read_ntag(conn, report)
             memory_title = "ПАМЯТЬ - СТРАНИЦЫ NTAG / ULTRALIGHT (hex)"
-        elif contact or sak in (0x20, 0x28):
-            print("[*] ISO 7816-4 / EMV: ищу приложения (PPSE)...")
+        elif contact:
+            # PPSE/EMV — только на реальном контактном интерфейсе.
+            print("[*] ISO 7816 / EMV: ищу приложения (PPSE)...")
             read_emv_apps(conn, report)
     except SmartcardException as exc:
         ERRORS.append("чтение: %s" % exc)
@@ -355,28 +420,28 @@ pause
 /* ---------- образец отчёта ---------- */
 
 export const SAMPLE_TXT = `============================================================
- CARD REPORT - ACR1281U (python, pyscard, v1.1)
- Дата: 2026-02-14 21:07:33
+ CARD REPORT - ACR1281U (python, pyscard, v1.2)
+ Дата: 2026-09-03 19:31:05
 ============================================================
 
 [ ПАРАМЕТРЫ ]
-  Ридер              : ACS ACR1281 2S CL Reader PICC 0
-  Интерфейс          : PICC — бесконтактный (RF 13.56 МГц)
-  Протокол           : T=1
-  Python             : 3.14.0
-  ATR                : 3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 01 00 00 00 00 6A
-  UID                : 04 A1 2B 32 4C 58 80
-  Длина UID          : 7 байт
-  ATQA (SENS_RES)    : 00 04
-  SAK (SEL_RES)      : 08
-  Тип карты          : Mifare Classic 1K
-  NFCID              : 04 A1 2B 32 4C 58 80
-  Режим PICC         : 106 кбит/с
-  Прочитано блоков   : 52 / 64
-  Секторов с ключом  : 13 / 16
+  Ридер               : ACS ACR1281 2S CL Reader PICC 0
+  Интерфейс           : PICC — бесконтактный (RF 13.56 МГц)
+  Протокол            : T=1
+  Python              : 3.14.6
+  ATR                 : 3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 01 00 00 00 00 6A
+  UID                 : 11 4B 06 12
+  Длина UID           : 4 байт
+  ATQA (SENS_RES)     : - (polling вернул 0 целей)
+  SAK (SEL_RES)       : - (polling вернул 0 целей)
+  Код карты (ACS)     : 0001
+  Тип карты           : Mifare Classic 1K
+  Источник типа       : из ATR (байты H10-H11, polling молчал)
+  Прочитано блоков    : 52 / 64
+  Секторов с ключом   : 13 / 16
 
 [ ПАМЯТЬ - БЛОКИ MIFARE (hex) ]
-  Блок 000 : 04 A1 2B 32 4C 58 80 04 58 08 04 00 00 00 12 9E
+  Блок 000 : 11 4B 06 12 5A 08 04 00 62 63 64 65 66 67 68 69
   Блок 001 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   Блок 002 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   Блок 003 : FF FF FF FF FF FF FF 07 80 69 FF FF FF FF FF FF
@@ -396,19 +461,20 @@ export const SAMPLE_JSON = `{
     "Ридер": "ACS ACR1281 2S CL Reader PICC 0",
     "Интерфейс": "PICC — бесконтактный (RF 13.56 МГц)",
     "Протокол": "T=1",
-    "Python": "3.14.0",
+    "Python": "3.14.6",
     "ATR": "3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 01 00 00 00 00 6A",
-    "UID": "04 A1 2B 32 4C 58 80",
-    "Длина UID": "7 байт",
-    "ATQA (SENS_RES)": "00 04",
-    "SAK (SEL_RES)": "08",
+    "UID": "11 4B 06 12",
+    "Длина UID": "4 байт",
+    "ATQA (SENS_RES)": "- (polling вернул 0 целей)",
+    "SAK (SEL_RES)": "- (polling вернул 0 целей)",
+    "Код карты (ACS)": "0001",
     "Тип карты": "Mifare Classic 1K",
-    "Режим PICC": "106 кбит/с",
+    "Источник типа": "из ATR (байты H10-H11, polling молчал)",
     "Прочитано блоков": "52 / 64",
     "Секторов с ключом": "13 / 16"
   },
   "memory": {
-    "Блок 000": "04 A1 2B 32 4C 58 80 04 58 08 04 00 00 00 00 12 9E",
+    "Блок 000": "11 4B 06 12 5A 08 04 00 62 63 64 65 66 67 68 69",
     "Блок 003": "FF FF FF FF FF FF FF 07 80 69 FF FF FF FF FF FF",
     "Блок 060": "D4 10 06 41 00 00 00 00 00 00 00 00 00 00 00 77"
   },
@@ -426,10 +492,10 @@ export interface LogLine {
 
 export const LOG_LINES: LogLine[] = [
   { t: "00.00", text: "Пробую: ACS ACR1281 2S CL Reader PICC 0 … подключено", tone: "info" },
-  { t: "00.12", text: "PICC Polling (D4 4A)… цель в поле 13.56 МГц", tone: "info" },
+  { t: "00.12", text: "PICC Polling (D4 4A)… 0 целей — карта уже активирована", tone: "warn" },
   { t: "00.31", text: "ATR: 3B 8F 80 01 80 4F 0C A0 00 00 03 06 …", tone: "acc" },
-  { t: "00.44", text: "UID (FF CA): 04 A1 2B 32 4C 58 80", tone: "acc" },
-  { t: "00.61", text: "SAK 08 → Mifare Classic 1K", tone: "ok" },
+  { t: "00.44", text: "UID (FF CA): 11 4B 06 12", tone: "acc" },
+  { t: "00.61", text: "ATR H10-H11 = 00 01 → Mifare Classic 1K (из ATR)", tone: "ok" },
   { t: "01.02", text: "Сектор 00 · ключ FF FF FF FF FF FF ✓", tone: "ok" },
   { t: "01.19", text: "Сектор 01 · ключ FF FF FF FF FF FF ✓", tone: "ok" },
   { t: "01.34", text: "Сектор 02 · ключ не подошёл — пропускаю", tone: "warn" },
@@ -512,9 +578,14 @@ export interface FaqItem {
 
 export const FAQS: FaqItem[] = [
   {
+    q: "Polling вернул 0 целей, но карта читается (v1.2)",
+    a: "У ридеров на PN532 (ACR122U/1281U) бесконтактная карта уже активирована PC/SC-слоем к моменту, когда скрипт шлёт Polling D4 4A, — чип не отдаёт её повторно и отвечает «0 целей». Поэтому ATQA/SAK пустые. Но тип карты зашит в синтетическом ATR ридера (байты H10-H11, коды ACS). С v1.2 скрипт и GUI читают этот код (например 0001 = Mifare Classic 1K) и продолжают чтение секторов — в отчёте появляется «Источник типа: из ATR».",
+    code: "Код карты (ACS) : 0001\nТип карты       : Mifare Classic 1K\nИсточник типа   : из ATR (байты H10-H11, polling молчал)",
+  },
+  {
     q: "Ошибка 0x1F «устройство не работает» при передаче APDU",
-    a: "Код 0x0000001F (ERROR_GEN_FAILURE) означает, что драйвер отклонил обмен: карте послана команда, которую она аппаратно не понимает — типично, когда «сырой» ISO 7816-4 SELECT (00 A4 …) уходит в NTAG/Ultralight через бесконтактный PICC-интерфейс. В v1.1 функция transmit() перехватывает такие сбои и пишет их в секцию «Ошибки» отчёта — скрипт больше не падает и файл всё равно создаётся. Для контактных EMV-карт вставьте карту в ICC-слот: скрипт сам переберёт интерфейсы PICC → ICC и выберет тот, где карта отвечает.",
-    code: "APDU 00 A4 04 00 0E … -> … (0x0000001F)\n# v1.1: попадает в [ ОШИБКИ ] отчёта, чтение продолжается",
+    a: "Код 0x0000001F (ERROR_GEN_FAILURE) — драйвер отклонил обмен: карте послана команда, которую она аппаратно не понимает. Две частые причины: (1) «сырой» ISO 7816-4 SELECT (00 A4 …) уходит в бесконтактную NTAG; (2) скрипт принимал бесконтактный ридер за контактный, потому что подстрока «ICC» входила в слово «PICC». В v1.2 интерфейсы различаются по границе слова (\\bICC\\b не совпадает с PICC), а PPSE/EMV отправляются только на реальном контактном интерфейсе. Любые сбои обмена перехватываются и пишутся в секцию «Ошибки» — скрипт не падает, файл создаётся всегда.",
+    code: "APDU 00 A4 04 00 0E … -> … (0x0000001F)\n# попадает в [ ОШИБКИ ] отчёта, чтение продолжается",
   },
   {
     q: "ModuleNotFoundError: No module named 'smartcard'",
