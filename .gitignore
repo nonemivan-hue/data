@@ -1,5 +1,23 @@
+# Node / Vite (сайт-справка)
 node_modules/
-.next/
 dist/
+*.local
+.vite/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# отчёты чтения карт — данные не публикуем
+card_report_*.txt
+card_report_*.json
+
+# ОС
+.DS_Store
+Thumbs.db
+desktop.ini
+.next/
 build/
 *.log
