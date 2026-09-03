@@ -1,2 +1,2 @@
-# Python 3.10 - 3.13, Windows
+# Python 3.10 - 3.14, Windows
 pyscard>=2.2.0

@@ -4,15 +4,24 @@ acr1281_dump.py — полное чтение параметров карты ч
 
 Установка:  pip install pyscard
 Запуск:     python acr1281_dump.py
-Результат:  card_report_<UID>_<дата>.txt   — отчёт "параметр : значение"
+Результат:  card_report_<UID>_<дата>.txt   — отчёт «параметр : значение»
             card_report_<UID>_<дата>.json  — те же данные в JSON
 
 Что читает:
   * ATR, протокол T=0/T=1, исторические байты (контактные и бесконтактные)
-  * UID, ATQA (SENS_RES), SAK (SEL_RES), тип карты  — Polling D4 4A
+  * UID, ATQA (SENS_RES), SAK (SEL_RES), тип карты   — Polling D4 4A
   * статус PICC (режим, скорость)                    — D4 32
+  * ATS для карт ISO 14443-4                         — FF CA 01 00
   * Mifare Classic 1K/4K/Mini: все сектора заводскими ключами
+  * NTAG / Ultralight: первые страницы памяти (без аутентификации)
   * контактные EMV-карты: список приложений из PPSE (1PAY.SYS.DDF01)
+
+История версий:
+  v1.1 — аппаратные ошибки обмена (0x1F «устройство не работает» и др.)
+         больше не валят скрипт: фиксируются в секции «Ошибки» отчёта;
+         автоперебор интерфейсов PICC -> ICC; чтение NTAG/Ultralight;
+         в отчёте появляются «Интерфейс», «ATS», «Python».
+  v1.0 — первый выпуск.
 """
 
 import json
@@ -21,10 +30,14 @@ from datetime import datetime
 
 from smartcard.System import readers
 from smartcard.CardConnection import CardConnection
-from smartcard.Exceptions import CardConnectionException, NoCardException
+from smartcard.Exceptions import (CardConnectionException, NoCardException,
+                                  SmartcardException)
+
+VERSION = "1.1"
 
 # ------------------------------------------------------------- APDU-команды
 GET_UID     = [0xFF, 0xCA, 0x00, 0x00, 0x00]                          # UID карты
+GET_ATS     = [0xFF, 0xCA, 0x01, 0x00, 0x00]                          # ATS (14443-4)
 PICC_POLL   = [0xFF, 0x00, 0x00, 0x00, 0x04, 0xD4, 0x4A, 0x01, 0x00]  # Polling
 PICC_STATUS = [0xFF, 0x00, 0x00, 0x00, 0x04, 0xD4, 0x32, 0x01, 0x00]  # статус PICC
 READ_BLOCK  = lambda blk: [0xFF, 0xB0, 0x00, blk, 0x10]               # Read Binary
@@ -47,6 +60,8 @@ SAK_TYPES = {
     0x28: "SmartMX / JCOP (ISO 14443-4 + Mifare)",
 }
 
+ERRORS = []  # ошибки обмена, не прерывающие чтение
+
 
 def hx(data):
     """Список байтов -> строка 'FF 00 3A'."""
@@ -54,26 +69,61 @@ def hx(data):
 
 
 def transmit(conn, apdu):
-    """Отправить APDU, вернуть (данные, SW1SW2)."""
-    data, sw1, sw2 = conn.transmit(list(apdu))
-    return data, (sw1 << 8) | sw2
+    """Отправить APDU. При аппаратной ошибке — ([], 0x6F00), без падения."""
+    try:
+        data, sw1, sw2 = conn.transmit(list(apdu))
+        return data, (sw1 << 8) | sw2
+    except SmartcardException as exc:
+        ERRORS.append("APDU %s -> %s" % (hx(apdu), exc))
+        return [], 0x6F00
 
 
-def find_reader():
-    """Найти ACR1281U или взять первый доступный PC/SC-ридер."""
+def find_readers():
+    """Ридеры ACR1281U (PICC первыми, затем ICC), иначе все PC/SC-ридеры."""
     found = readers()
     if not found:
         sys.exit("[!] Ридеры не найдены. Проверьте драйвер ACS CCID "
-                 "и службу Windows 'Смарт-карта' (scardsvr).")
-    for r in found:
-        if "1281" in str(r).upper():
-            return r
-    print("[~] ACR1281U не найден, беру первый ридер: %s" % found[0])
-    return found[0]
+                 "и службу Windows «Смарт-карта» (scardsvr).")
+    prefs = [r for r in found if "1281" in str(r).upper()] or found
+    picc = [r for r in prefs if "PICC" in str(r).upper()]
+    icc = [r for r in prefs if "ICC" in str(r).upper()]
+    rest = [r for r in prefs if r not in picc and r not in icc]
+    return picc + icc + rest
+
+
+def interface_of(name):
+    n = str(name).upper()
+    if "PICC" in n:
+        return "PICC — бесконтактный (RF 13.56 МГц)"
+    if "ICC" in n:
+        return "ICC — контактный (слот смарт-карты)"
+    if "SAM" in n:
+        return "SAM-слот"
+    return "PC/SC"
+
+
+def connect_any():
+    """Подключиться к первому ридеру, где карта отвечает."""
+    last_err = None
+    for r in find_readers():
+        print("[*] Пробую: %s" % r)
+        try:
+            conn = r.createConnection()
+            conn.connect(CardConnection.T0_protocol | CardConnection.T1_protocol)
+            print("    подключено (%s)" % interface_of(r))
+            return r, conn
+        except NoCardException:
+            print("    нет карты")
+        except CardConnectionException as exc:
+            last_err = exc
+            print("    ошибка: %s" % exc)
+    sys.exit("[!] Ни на одном интерфейсе карта не ответила. "
+             "Положите карту на ридер или вставьте в ICC-слот.%s"
+             % ("\n    Последняя ошибка: %s" % last_err if last_err else ""))
 
 
 def poll_card(conn, report):
-    """Бесконтактная часть: UID, ATQA, SAK, тип. Возвращает SAK или None."""
+    """Бесконтактная часть: UID, ATQA, SAK, тип, ATS. Возвращает SAK/None."""
     uid, sw = transmit(conn, GET_UID)
     if sw == 0x9000 and uid:
         report["UID"] = hx(uid)
@@ -100,6 +150,11 @@ def poll_card(conn, report):
         modes = {0x00: "авто", 0x01: "106 кбит/с", 0x02: "212 кбит/с",
                  0x04: "424 кбит/с", 0x08: "848 кбит/с"}
         report["Режим PICC"] = modes.get(data[2], "%02X" % data[2])
+
+    if sak in (0x20, 0x28):
+        ats, sw = transmit(conn, GET_ATS)
+        if sw == 0x9000 and ats:
+            report["ATS"] = hx(ats)
     return sak
 
 
@@ -141,7 +196,7 @@ def read_mifare(conn, sak, report):
         for i in range(count):
             data, sw = transmit(conn, READ_BLOCK(first + i))
             if sw == 0x9000:
-                blocks[first + i] = hx(data)
+                blocks["Блок %03d" % (first + i)] = hx(data)
                 read_ok += 1
 
     report["Прочитано блоков"] = "%d / %d" % (read_ok, total_blocks)
@@ -149,8 +204,20 @@ def read_mifare(conn, sak, report):
     return blocks
 
 
+def read_ntag(conn, report):
+    """NTAG / Ultralight: первые 64 байта (страницы 00-0F), ключи не нужны."""
+    pages = {}
+    for start in (0x00, 0x04, 0x08, 0x0C):
+        data, sw = transmit(conn, READ_BLOCK(start))
+        if sw == 0x9000:
+            pages["Стр. %02X-%02X" % (start, start + 3)] = hx(data)
+    if pages:
+        report["Страниц прочитано"] = "%d по 4 (00-0F), 16 байт" % len(pages)
+    return pages
+
+
 def read_emv_apps(conn, report):
-    """Контактные EMV: каталог PPSE -> список AID приложений."""
+    """EMV: каталог PPSE -> список AID приложений."""
     ppse = [0x00, 0xA4, 0x04, 0x00, 0x0E] + list(b"1PAY.SYS.DDF01")
     if transmit(conn, ppse)[1] != 0x9000:
         return
@@ -169,12 +236,12 @@ def read_emv_apps(conn, report):
             i += 2 + ln
 
 
-def build_txt(report, blocks):
+def build_txt(report, memory, memory_title):
     """Собрать текстовый отчёт: параметр : значение."""
     w = max(len(k) for k in report) + 2 if report else 20
     out = [
         "=" * 60,
-        " CARD REPORT - ACR1281U (python, pyscard)",
+        " CARD REPORT - ACR1281U (python, pyscard, v%s)" % VERSION,
         " Дата: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "=" * 60,
         "",
@@ -182,60 +249,85 @@ def build_txt(report, blocks):
     ]
     for k, v in report.items():
         out.append("  %-*s : %s" % (w, k, v))
-    if blocks:
-        out += ["", "[ ПАМЯТЬ - БЛОКИ MIFARE (hex) ]"]
-        for blk in sorted(blocks):
-            out.append("  Блок %03d : %s" % (blk, blocks[blk]))
+    if memory:
+        out += ["", "[ %s ]" % memory_title]
+        for k, v in memory.items():
+            out.append("  %s : %s" % (k, v))
+    if ERRORS:
+        out += ["", "[ ОШИБКИ (чтение не прервано) ]"]
+        for e in ERRORS:
+            out.append("  - " + e)
     out.append("")
     return "\n".join(out)
 
 
 def main():
     print("=" * 60)
-    print("  ACR1281U · ПОЛНОЕ ЧТЕНИЕ ПАРАМЕТРОВ КАРТЫ")
+    print("  ACR1281U · ПОЛНОЕ ЧТЕНИЕ ПАРАМЕТРОВ КАРТЫ  (v%s)" % VERSION)
     print("=" * 60)
 
-    reader = find_reader()
-    print("[*] Ридер: %s" % reader)
+    reader, conn = connect_any()
 
-    conn = reader.createConnection()
     try:
-        conn.connect(CardConnection.T0_protocol | CardConnection.T1_protocol)
-    except NoCardException:
-        sys.exit("[!] Карта не обнаружена. Положите её на ридер и повторите.")
-    except CardConnectionException as exc:
-        sys.exit("[!] Ошибка соединения: %s" % exc)
-
-    proto = {0: "direct", 1: "T=0", 2: "T=1", 3: "T=0+T=1"}.get(
-        conn.getProtocol(), "?")
+        proto = {0: "direct", 1: "T=0", 2: "T=1", 3: "T=0+T=1"}.get(
+            conn.getProtocol(), "?")
+    except SmartcardException:
+        proto = "?"
 
     report = {
         "Ридер": str(reader),
+        "Интерфейс": interface_of(reader),
         "Протокол": proto,
-        "ATR": hx(conn.getATR()),
+        "Python": sys.version.split()[0],
     }
+    try:
+        report["ATR"] = hx(conn.getATR())
+    except SmartcardException as exc:
+        report["ATR"] = "-"
+        ERRORS.append("getATR: %s" % exc)
 
-    sak = poll_card(conn, report)
+    memory = {}
+    memory_title = ""
+    try:
+        contact = "ICC" in str(reader).upper()
+        sak = poll_card(conn, report)
 
-    blocks = {}
-    if sak in (0x08, 0x09, 0x18):
-        print("[*] Mifare Classic: читаю сектора...")
-        blocks = read_mifare(conn, sak, report)
-    else:
-        read_emv_apps(conn, report)
+        if sak in (0x08, 0x09, 0x18):
+            print("[*] Mifare Classic: читаю сектора...")
+            memory = read_mifare(conn, sak, report)
+            memory_title = "ПАМЯТЬ - БЛОКИ MIFARE (hex)"
+        elif sak == 0x00:
+            print("[*] NTAG / Ultralight: читаю страницы...")
+            memory = read_ntag(conn, report)
+            memory_title = "ПАМЯТЬ - СТРАНИЦЫ NTAG / ULTRALIGHT (hex)"
+        elif contact or sak in (0x20, 0x28):
+            print("[*] ISO 7816-4 / EMV: ищу приложения (PPSE)...")
+            read_emv_apps(conn, report)
+    except SmartcardException as exc:
+        ERRORS.append("чтение: %s" % exc)
+    finally:
+        try:
+            conn.disconnect()
+        except SmartcardException:
+            pass
+
+    if ERRORS:
+        report["Ошибок при чтении"] = str(len(ERRORS))
 
     uid_tag = report.get("UID", "").replace(" ", "")[:14] or "CONTACT"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = "card_report_%s_%s" % (uid_tag, stamp)
 
     with open(base + ".txt", "w", encoding="utf-8") as f:
-        f.write(build_txt(report, blocks))
+        f.write(build_txt(report, memory, memory_title))
     with open(base + ".json", "w", encoding="utf-8") as f:
-        json.dump({"report": report, "blocks": blocks},
+        json.dump({"report": report, "memory": memory, "errors": ERRORS},
                   f, ensure_ascii=False, indent=2)
 
     print("[+] Сохранено: %s.txt" % base)
     print("[+] Сохранено: %s.json" % base)
+    if ERRORS:
+        print("[!] Ошибок: %d — записаны в отчёт, скрипт не падал." % len(ERRORS))
 
 
 if __name__ == "__main__":
